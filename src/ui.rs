@@ -77,6 +77,35 @@ pub struct App {
 
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        // ── 日本語フォント登録 ──
+        let mut fonts = egui::FontDefinitions::default();
+        // Windows システムフォントを順番に試す
+        let jp_font_paths = [
+            "C:/Windows/Fonts/meiryo.ttc",
+            "C:/Windows/Fonts/msgothic.ttc",
+            "C:/Windows/Fonts/YuGothM.ttc",
+            "C:/Windows/Fonts/yugothm.ttc",
+        ];
+        for path in &jp_font_paths {
+            if let Ok(data) = std::fs::read(path) {
+                fonts.font_data.insert(
+                    "jp_font".to_owned(),
+                    egui::FontData::from_owned(data),
+                );
+                // proportional / monospace 両方に日本語フォントを追加
+                fonts.families
+                    .entry(egui::FontFamily::Proportional)
+                    .or_default()
+                    .push("jp_font".to_owned());
+                fonts.families
+                    .entry(egui::FontFamily::Monospace)
+                    .or_default()
+                    .push("jp_font".to_owned());
+                break;
+            }
+        }
+        cc.egui_ctx.set_fonts(fonts);
+
         let mut visuals = egui::Visuals::dark();
         visuals.panel_fill = BG;
         visuals.window_fill = PANEL;
