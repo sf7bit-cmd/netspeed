@@ -37,6 +37,7 @@ struct SpeedResult {
 struct ScanState {
     running:  bool,
     progress: f32,
+    status:   String,
     hosts:    Vec<HostResult>,
 }
 
@@ -228,35 +229,62 @@ impl App {
             parts[1].parse::<u8>().unwrap_or(168),
             parts[2].parse::<u8>().unwrap_or(1),
         ];
-        { let mut s = self.scan_state.lock().unwrap(); s.running = true; s.progress = 0.0; s.hosts.clear(); }
+        {
+            let mut s = self.scan_state.lock().unwrap();
+            s.running = true; s.progress = 0.0;
+            s.status = "ARPテーブル取得中...".into();
+            s.hosts.clear();
+        }
         self.scan_stop.store(false, Ordering::Relaxed);
-        self.add_log(&format!("スキャン: {}.1–254", self.subnet_input), ACCENT);
+        self.add_log(&format!("スキャン開始: {}.1–254", self.subnet_input), ACCENT);
 
-        let ss    = Arc::clone(&self.scan_state);
-        let log   = Arc::clone(&self.log_lines);
-        let stop  = Arc::clone(&self.scan_stop);
-        let ctx   = ctx.clone();
+        let ss   = Arc::clone(&self.scan_state);
+        let log  = Arc::clone(&self.log_lines);
+        let stop = Arc::clone(&self.scan_stop);
+        let ctx  = ctx.clone();
 
         thread::spawn(move || {
-            let ss2 = Arc::clone(&ss);
-            let ss3 = Arc::clone(&ss);
-            let log2 = Arc::clone(&log);
-            let ctx2 = ctx.clone();
-            let ctx3 = ctx.clone();
+            let ss_found = Arc::clone(&ss);
+            let ss_prog  = Arc::clone(&ss);
+            let log2     = Arc::clone(&log);
+            let ctx2     = ctx.clone();
+            let ctx3     = ctx.clone();
+
             scan::scan_subnet(subnet, 500,
                 move |host| {
                     let name = host.hostname.clone().unwrap_or_else(|| "—".into());
-                    log2.lock().unwrap().push((
-                        format!("[{}] {} ({})  {:.0}ms", now_str(), host.ip, name, host.latency_ms),
-                        ACCENT3));
-                    ss2.lock().unwrap().hosts.push(host);
+                    // 重複IPは上書き（ARP仮登録 → TCP詳細で更新）
+                    let mut state = ss_found.lock().unwrap();
+                    if let Some(existing) = state.hosts.iter_mut().find(|h| h.ip == host.ip) {
+                        // latency が実測値なら更新
+                        if host.latency_ms > 0.0 { *existing = host.clone(); }
+                    } else {
+                        log2.lock().unwrap().push((
+                            format!("[{}] {} ({})  {:.0}ms", now_str(), host.ip, name, host.latency_ms),
+                            ACCENT3));
+                        state.hosts.push(host);
+                        // IP アドレス順にソート
+                        state.hosts.sort_by_key(|h| {
+                            let o = h.ip.octets();
+                            ((o[0] as u32) << 24) | ((o[1] as u32) << 16) | ((o[2] as u32) << 8) | o[3] as u32
+                        });
+                    }
                     ctx2.request_repaint();
                 },
-                move |p| { ss3.lock().unwrap().progress = p; ctx3.request_repaint(); },
+                move |p, status| {
+                    let mut s = ss_prog.lock().unwrap();
+                    s.progress = p;
+                    s.status = status;
+                    ctx3.request_repaint();
+                },
                 stop,
             );
             let found = ss.lock().unwrap().hosts.len();
-            ss.lock().unwrap().running = false;
+            {
+                let mut s = ss.lock().unwrap();
+                s.running = false;
+                s.status = format!("完了: {}台検出", found);
+            }
             log.lock().unwrap().push((
                 format!("[{}] スキャン完了: {}台", now_str(), found),
                 if found > 0 { ACCENT3 } else { MUTED }));
@@ -591,13 +619,17 @@ impl App {
                     }
                 });
 
-                // プログレス
+                // プログレス + ステータス
                 {
                     let s = self.scan_state.lock().unwrap();
                     if s.running || s.progress > 0.0 {
                         ui.add_space(6.0);
-                        ui.add(egui::ProgressBar::new(s.progress)
-                            .desired_width(ui.available_width()));
+                        ui.horizontal(|ui| {
+                            ui.add(egui::ProgressBar::new(s.progress)
+                                .desired_width(ui.available_width() - 160.0));
+                            ui.label(RichText::new(&s.status)
+                                .font(FontId::monospace(10.0)).color(MUTED));
+                        });
                     }
                 }
 
@@ -617,7 +649,7 @@ impl App {
 
                 let hosts = self.scan_state.lock().unwrap().hosts.clone();
 
-                egui::ScrollArea::vertical().max_height(340.0).show(ui, |ui| {
+                egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                     if hosts.is_empty() {
                         ui.label(RichText::new("スキャン待機中...").font(FontId::monospace(11.0)).color(MUTED));
                     }
