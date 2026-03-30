@@ -1,95 +1,98 @@
-// src/iperf.rs — LAN内スループット測定（内蔵サーバー/クライアント）
+// src/measure.rs — ダウンロード・アップロード・Ping 測定
 
-use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
-use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 use std::time::{Duration, Instant};
 
-pub const DEFAULT_PORT: u16 = 15101;
-pub const TEST_DURATION_SECS: u64 = 5;
-const CHUNK_SIZE: usize = 128 * 1024; // 128KB
+const DOWN_URL: &str = "https://speed.cloudflare.com/__down?bytes=10000000";
+const UP_URL:   &str = "https://speed.cloudflare.com/__up";
+const PING_URL: &str = "https://speed.cloudflare.com/__down?bytes=1";
 
-#[derive(Clone, Debug, Default)]
-pub struct IperfResult {
-    pub mbps:      f64,
-    pub bytes:     u64,
-    pub duration:  f64,
-    pub direction: String,
+fn client() -> reqwest::blocking::Client {
+    reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .user_agent("NetSpeedAnalyzer/0.1")
+        .build()
+        .expect("HTTP client error")
 }
 
-/// サーバーモード：接続を待ち受けてデータを受信、速度を返す
-pub fn run_server(stop: Arc<AtomicBool>) -> Option<IperfResult> {
-    let listener = TcpListener::bind(format!("0.0.0.0:{}", DEFAULT_PORT)).ok()?;
-    listener.set_nonblocking(true).ok()?;
+/// Ping を n 回計測して平均・最小・最大・ジッターを返す (ms)
+pub struct PingResult {
+    pub avg: f64,
+    pub min: f64,
+    pub max: f64,
+    pub jitter: f64,
+}
 
-    // 接続待ち（最大10秒）
-    let wait_start = Instant::now();
-    let mut stream = loop {
-        if stop.load(Ordering::Relaxed) { return None; }
-        match listener.accept() {
-            Ok((s, _)) => break s,
-            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                if wait_start.elapsed().as_secs() > 10 { return None; }
-                std::thread::sleep(Duration::from_millis(50));
+pub fn measure_ping(n: usize) -> Option<PingResult> {
+    let c = client();
+    let mut samples = Vec::with_capacity(n);
+    for _ in 0..n {
+        let t0 = Instant::now();
+        if c.head(PING_URL).send().is_ok() {
+            samples.push(t0.elapsed().as_secs_f64() * 1000.0);
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    if samples.is_empty() { return None; }
+    let avg = samples.iter().sum::<f64>() / samples.len() as f64;
+    let min = samples.iter().cloned().fold(f64::INFINITY, f64::min);
+    let max = samples.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    // jitter = mean absolute deviation between consecutive samples
+    let jitter = if samples.len() > 1 {
+        samples.windows(2).map(|w| (w[1] - w[0]).abs()).sum::<f64>()
+            / (samples.len() - 1) as f64
+    } else { 0.0 };
+    Some(PingResult { avg, min, max, jitter })
+}
+
+/// ダウンロード速度 (Mbps)。samples 回計測して平均を返す。
+/// callback で途中結果を通知する。
+pub fn measure_download<F>(samples: usize, mut on_sample: F) -> Option<f64>
+where
+    F: FnMut(f64),
+{
+    let c = client();
+    let mut results = Vec::with_capacity(samples);
+    for i in 0..samples {
+        let url = format!("{}?r={}", DOWN_URL, i);
+        let t0 = Instant::now();
+        match c.get(&url).send().and_then(|r| r.bytes()) {
+            Ok(bytes) => {
+                let elapsed = t0.elapsed().as_secs_f64();
+                if elapsed > 0.0 {
+                    let mbps = (bytes.len() as f64 * 8.0) / elapsed / 1_000_000.0;
+                    results.push(mbps);
+                    on_sample(mbps);
+                }
             }
-            Err(_) => return None,
+            Err(_) => {}
         }
-    };
-
-    stream.set_nonblocking(false).ok()?;
-    let mut buf = vec![0u8; CHUNK_SIZE];
-    let mut total_bytes = 0u64;
-    let t0 = Instant::now();
-
-    loop {
-        match stream.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => { total_bytes += n as u64; }
-            Err(_) => break,
-        }
-        if t0.elapsed().as_secs() > TEST_DURATION_SECS + 2 { break; }
     }
-
-    let elapsed = t0.elapsed().as_secs_f64();
-    if elapsed < 0.1 { return None; }
-
-    Some(IperfResult {
-        mbps:      (total_bytes as f64 * 8.0) / elapsed / 1_000_000.0,
-        bytes:     total_bytes,
-        duration:  elapsed,
-        direction: "RX (server)".into(),
-    })
+    if results.is_empty() { return None; }
+    Some(results.iter().sum::<f64>() / results.len() as f64)
 }
 
-/// クライアントモード：指定IPにデータを送信して速度を計測
-pub fn run_client(target_ip: &str, stop: Arc<AtomicBool>) -> Option<IperfResult> {
-    let addr = format!("{}:{}", target_ip, DEFAULT_PORT);
-    let mut stream = TcpStream::connect_timeout(
-        &addr.parse().ok()?,
-        Duration::from_secs(5),
-    ).ok()?;
-
-    let buf = vec![0xABu8; CHUNK_SIZE];
-    let mut total_bytes = 0u64;
-    let t0 = Instant::now();
-    let duration = Duration::from_secs(TEST_DURATION_SECS);
-
-    while t0.elapsed() < duration {
-        if stop.load(Ordering::Relaxed) { break; }
-        match stream.write(&buf) {
-            Ok(n) => { total_bytes += n as u64; }
-            Err(_) => break,
+/// アップロード速度 (Mbps)。
+pub fn measure_upload<F>(samples: usize, mut on_sample: F) -> Option<f64>
+where
+    F: FnMut(f64),
+{
+    use rand::RngCore;
+    let c = client();
+    let mut results = Vec::with_capacity(samples);
+    let size = 2 * 1024 * 1024usize; // 2 MB
+    for _ in 0..samples {
+        let mut data = vec![0u8; size];
+        rand::thread_rng().fill_bytes(&mut data);
+        let t0 = Instant::now();
+        // cloudflare returns 400 but data was transmitted
+        let _ = c.post(UP_URL).body(data).send();
+        let elapsed = t0.elapsed().as_secs_f64();
+        if elapsed > 0.0 {
+            let mbps = (size as f64 * 8.0) / elapsed / 1_000_000.0;
+            results.push(mbps);
+            on_sample(mbps);
         }
     }
-    drop(stream);
-
-    let elapsed = t0.elapsed().as_secs_f64();
-    if elapsed < 0.1 { return None; }
-
-    Some(IperfResult {
-        mbps:      (total_bytes as f64 * 8.0) / elapsed / 1_000_000.0,
-        bytes:     total_bytes,
-        duration:  elapsed,
-        direction: "TX (client)".into(),
-    })
+    if results.is_empty() { return None; }
+    Some(results.iter().sum::<f64>() / results.len() as f64)
 }
