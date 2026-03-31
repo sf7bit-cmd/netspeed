@@ -535,3 +535,164 @@ impl App {
     }
 
 
+
+    // ── History tab ──────────────────────────────────
+    fn draw_history_tab(&mut self, ui: &mut egui::Ui) {
+        egui::Frame::none().fill(PANEL).rounding(8.0)
+            .inner_margin(egui::Margin::same(14.0))
+            .show(ui, |ui| {
+                section_title(ui, "MEASUREMENT HISTORY");
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.add(egui::Button::new(
+                        RichText::new("Save CSV").font(FontId::monospace(11.0)).color(ACCENT))
+                        .stroke(Stroke::new(1.0, ACCENT)).fill(Color32::TRANSPARENT)
+                    ).clicked() {
+                        match history::save_csv(&self.speed_history) {
+                            Ok(p)  => self.add_log(&format!("CSV: {}", p.display()), ACCENT3),
+                            Err(e) => self.add_log(&format!("Error: {}", e), DANGER),
+                        }
+                    }
+                    if ui.add(egui::Button::new(
+                        RichText::new("Save JSON").font(FontId::monospace(11.0)).color(ACCENT2))
+                        .stroke(Stroke::new(1.0, ACCENT2)).fill(Color32::TRANSPARENT)
+                    ).clicked() {
+                        match history::save_json(&self.speed_history) {
+                            Ok(p)  => self.add_log(&format!("JSON: {}", p.display()), ACCENT3),
+                            Err(e) => self.add_log(&format!("Error: {}", e), DANGER),
+                        }
+                    }
+                    if ui.add(egui::Button::new(
+                        RichText::new("Clear").font(FontId::monospace(11.0)).color(MUTED))
+                        .stroke(Stroke::new(1.0, MUTED)).fill(Color32::TRANSPARENT)
+                    ).clicked() { self.speed_history.clear(); }
+                });
+                ui.add_space(8.0);
+
+                if self.speed_history.is_empty() {
+                    ui.label(RichText::new("No history. Run Speed Test to record.")
+                        .font(FontId::monospace(11.0)).color(MUTED));
+                    return;
+                }
+
+                let dl_pts: PlotPoints = self.speed_history.iter().enumerate()
+                    .filter_map(|(i, e)| e.dl_mbps.map(|v| [i as f64, v])).collect();
+                let ul_pts: PlotPoints = self.speed_history.iter().enumerate()
+                    .filter_map(|(i, e)| e.ul_mbps.map(|v| [i as f64, v])).collect();
+                let ping_pts: PlotPoints = self.speed_history.iter().enumerate()
+                    .filter_map(|(i, e)| e.ping_ms.map(|v| [i as f64, v])).collect();
+
+                Plot::new("hist_graph")
+                    .height(110.0).show_axes([false, true])
+                    .allow_zoom(false).allow_drag(false)
+                    .show(ui, |p| {
+                        p.line(Line::new(dl_pts).color(ACCENT).width(2.0).name("DL Mbps"));
+                        p.line(Line::new(ul_pts).color(ACCENT2).width(2.0).name("UL Mbps"));
+                        p.line(Line::new(ping_pts).color(ACCENT3).width(1.5).name("Ping ms"));
+                    });
+
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    for h in ["#", "Timestamp", "DL(Mbps)", "UL(Mbps)", "Ping(ms)", "Jitter(ms)"] {
+                        ui.label(RichText::new(h).font(FontId::monospace(10.0)).color(MUTED));
+                        ui.add_space(20.0);
+                    }
+                });
+                ui.separator();
+                egui::ScrollArea::vertical().max_height(200.0).show(ui, |ui| {
+                    for (i, e) in self.speed_history.iter().enumerate().rev() {
+                        ui.horizontal(|ui| {
+                            let row = [
+                                format!("{}", i + 1),
+                                e.timestamp.clone(),
+                                e.dl_mbps.map(|v| format!("{:.1}", v)).unwrap_or_else(|| "-".into()),
+                                e.ul_mbps.map(|v| format!("{:.1}", v)).unwrap_or_else(|| "-".into()),
+                                e.ping_ms.map(|v| format!("{:.1}", v)).unwrap_or_else(|| "-".into()),
+                                e.jitter_ms.map(|v| format!("{:.1}", v)).unwrap_or_else(|| "-".into()),
+                            ];
+                            for val in &row {
+                                ui.label(RichText::new(val).font(FontId::monospace(11.0))
+                                    .color(Color32::from_rgb(200, 223, 240)));
+                                ui.add_space(20.0);
+                            }
+                        });
+                    }
+                });
+            });
+    }
+
+    fn draw_log(&self, ui: &mut egui::Ui) {
+        egui::Frame::none().fill(PANEL).rounding(8.0)
+            .inner_margin(egui::Margin::same(10.0))
+            .show(ui, |ui| {
+                section_title(ui, "SYSTEM LOG");
+                ui.add_space(4.0);
+                egui::ScrollArea::vertical().max_height(70.0).stick_to_bottom(true)
+                    .show(ui, |ui| {
+                        for (msg, color) in self.log_lines.lock().unwrap().iter() {
+                            ui.label(RichText::new(msg).font(FontId::monospace(9.0)).color(*color));
+                        }
+                    });
+            });
+    }
+}
+
+// ── Helpers ──────────────────────────────────────────
+
+fn gauge_card(ui: &mut egui::Ui, label: &str, val: Option<f64>,
+              unit: &str, color: Color32, max: f64, _testing: bool) {
+    egui::Frame::none().fill(PANEL).rounding(8.0)
+        .stroke(Stroke::new(1.0, color.linear_multiply(0.3)))
+        .inner_margin(egui::Margin::same(12.0))
+        .show(ui, |ui| {
+            ui.label(RichText::new(label).font(FontId::monospace(9.0)).color(MUTED));
+            ui.add_space(6.0);
+            ui.label(RichText::new(val.map(|v| format!("{:.1}", v)).unwrap_or_else(|| "-".into()))
+                .font(FontId::monospace(34.0))
+                .color(if val.is_some() { color } else { MUTED }).strong());
+            ui.label(RichText::new(unit).font(FontId::monospace(10.0)).color(MUTED));
+            ui.add_space(6.0);
+            let pct = val.map(|v| (v / max).min(1.0) as f32).unwrap_or(0.0);
+            let (r, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 3.0), egui::Sense::hover());
+            ui.painter().rect_filled(r, 1.0, Color32::from_rgba_unmultiplied(255,255,255,8));
+            if pct > 0.0 {
+                let f = egui::Rect::from_min_size(r.min, Vec2::new(r.width() * pct, r.height()));
+                ui.painter().rect_filled(f, 1.0, color);
+            }
+        });
+}
+
+fn section_title(ui: &mut egui::Ui, t: &str) {
+    ui.horizontal(|ui| {
+        ui.label(RichText::new(t).font(FontId::monospace(9.0)).color(MUTED));
+        ui.add(egui::Separator::default().horizontal().spacing(6.0));
+    });
+}
+
+fn info_row(ui: &mut egui::Ui, k: &str, v: Option<String>) {
+    ui.horizontal(|ui| {
+        ui.label(RichText::new(k).font(FontId::monospace(9.0)).color(MUTED));
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.label(RichText::new(v.unwrap_or_else(|| "-".into()))
+                .font(FontId::monospace(10.0)).color(Color32::from_rgb(200,223,240)));
+        });
+    });
+}
+
+fn legend_dot(ui: &mut egui::Ui, color: Color32, label: &str) {
+    ui.horizontal(|ui| {
+        let (r, _) = ui.allocate_exact_size(Vec2::new(10.0, 3.0), egui::Sense::hover());
+        ui.painter().rect_filled(r, 1.0, color);
+        ui.label(RichText::new(label).font(FontId::monospace(9.0)).color(MUTED));
+    });
+}
+
+fn pts(data: &[f64]) -> PlotPoints {
+    data.iter().enumerate().map(|(i, &v)| [i as f64, v]).collect()
+}
+
+fn now_str() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let s = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+    format!("{:02}:{:02}:{:02}", (s/3600)%24, (s/60)%60, s%60)
+}
