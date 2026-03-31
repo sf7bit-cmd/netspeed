@@ -971,4 +971,3 @@ fn now_str() -> String {
 }
 
 }
-}
