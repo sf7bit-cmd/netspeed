@@ -1,75 +1,537 @@
-// src/history.rs — 測定履歴の保存（CSV/JSON）
 
-use std::fs;
-use std::path::PathBuf;
-use std::time::{SystemTime, UNIX_EPOCH};
 
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
-pub struct HistoryEntry {
-    pub timestamp:  String,
-    pub dl_mbps:    Option<f64>,
-    pub ul_mbps:    Option<f64>,
-    pub ping_ms:    Option<f64>,
-    pub jitter_ms:  Option<f64>,
+use std::sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}};
+use std::thread;
+use egui::{Color32, FontId, RichText, Stroke, Vec2};
+use egui_plot::{Line, Plot, PlotPoints};
+
+use crate::measure;
+use crate::scan::{self, HostResult};
+use crate::history::{self, HistoryEntry};
+use crate::wifi::{self, WifiInfo};
+use crate::iperf;
+
+const BG:     Color32 = Color32::from_rgb(8,  12, 16);
+const PANEL:  Color32 = Color32::from_rgb(13, 21, 32);
+const ACCENT: Color32 = Color32::from_rgb(0, 212, 255);
+const ACCENT2:Color32 = Color32::from_rgb(255, 107, 53);
+const ACCENT3:Color32 = Color32::from_rgb(57, 255, 20);
+const MUTED:  Color32 = Color32::from_rgb(58, 84, 112);
+const DANGER: Color32 = Color32::from_rgb(255, 45, 85);
+const WARN:   Color32 = Color32::from_rgb(255, 190, 0);
+
+#[derive(Default, Clone, PartialEq)]
+enum TestState { #[default] Idle, Running, Done }
+
+#[derive(Default, Clone)]
+struct SpeedResult {
+    dl_mbps:  Option<f64>,
+    ul_mbps:  Option<f64>,
+    ping_ms:  Option<f64>,
+    jitter:   Option<f64>,
+    min_ping: Option<f64>,
+    max_ping: Option<f64>,
 }
 
-pub fn history_path(ext: &str) -> PathBuf {
-    let mut p = std::env::current_exe()
-        .unwrap_or_else(|_| PathBuf::from("."));
-    p.pop();
-    p.push(format!("netspeed_history.{}", ext));
-    p
+#[derive(Default, Clone)]
+struct ScanState {
+    running:  bool,
+    progress: f32,
+    status:   String,
+    hosts:    Vec<HostResult>,
 }
 
-fn timestamp_str() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    // ISO 8601 近似（UTCオフセット省略）
-    let s = secs % 60;
-    let m = (secs / 60) % 60;
-    let h = (secs / 3600) % 24;
-    let days = secs / 86400;
-    // 簡易日付計算（UTC）
-    let year = 1970 + days / 365;
-    let doy  = days % 365;
-    let month = doy / 30 + 1;
-    let day   = doy % 30 + 1;
-    format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z", year, month, day, h, m, s)
+#[derive(Default, Clone, PartialEq)]
+enum IperfMode { #[default] Idle, Running, Done }
+
+#[derive(Default, Clone)]
+struct IperfState {
+    mode:        IperfMode,
+    smb_path:    String,   // \\server\share  or  Z:\
+    live_mbps:   f64,
+    result:      Option<iperf::IperfResult>,
+    history:     Vec<(String, f64)>,  // (Write/Read, Mbps)
 }
 
-pub fn save_csv(entries: &[HistoryEntry]) -> Result<PathBuf, String> {
-    let path = history_path("csv");
-    let mut out = String::from("timestamp,dl_mbps,ul_mbps,ping_ms,jitter_ms\n");
-    for e in entries {
-        out += &format!(
-            "{},{},{},{},{}\n",
-            e.timestamp,
-            e.dl_mbps.map(|v| format!("{:.2}", v)).unwrap_or_default(),
-            e.ul_mbps.map(|v| format!("{:.2}", v)).unwrap_or_default(),
-            e.ping_ms.map(|v| format!("{:.2}", v)).unwrap_or_default(),
-            e.jitter_ms.map(|v| format!("{:.2}", v)).unwrap_or_default(),
-        );
+pub struct App {
+    test_state:   TestState,
+    result:       Arc<Mutex<SpeedResult>>,
+    dl_history:   Arc<Mutex<Vec<f64>>>,
+    ul_history:   Arc<Mutex<Vec<f64>>>,
+    ping_history: Arc<Mutex<Vec<f64>>>,
+    log_lines:    Arc<Mutex<Vec<(String, Color32)>>>,
+    stop_flag:    Arc<AtomicBool>,
+
+    subnet_input: String,
+    scan_state:   Arc<Mutex<ScanState>>,
+    scan_stop:    Arc<AtomicBool>,
+
+    speed_history: Vec<HistoryEntry>,
+
+    wifi_info:    Arc<Mutex<WifiInfo>>,
+    wifi_timer:   f64,
+
+    iperf_state:  Arc<Mutex<IperfState>>,
+    iperf_stop:   Arc<AtomicBool>,
+
+    active_tab:   u8,  // 0=Speed, 1=LAN, 2=iperf, 3=History
+}
+
+impl App {
+    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+
+        let mut fonts = egui::FontDefinitions::default();
+
+        let jp_font_paths = [
+            "C:/Windows/Fonts/meiryo.ttc",
+            "C:/Windows/Fonts/msgothic.ttc",
+            "C:/Windows/Fonts/YuGothM.ttc",
+            "C:/Windows/Fonts/yugothm.ttc",
+        ];
+        for path in &jp_font_paths {
+            if let Ok(data) = std::fs::read(path) {
+                fonts.font_data.insert(
+                    "jp_font".to_owned(),
+                    egui::FontData::from_owned(data),
+                );
+
+                fonts.families
+                    .entry(egui::FontFamily::Proportional)
+                    .or_default()
+                    .push("jp_font".to_owned());
+                fonts.families
+                    .entry(egui::FontFamily::Monospace)
+                    .or_default()
+                    .push("jp_font".to_owned());
+                break;
+            }
+        }
+        cc.egui_ctx.set_fonts(fonts);
+
+        let mut visuals = egui::Visuals::dark();
+        visuals.panel_fill = BG;
+        visuals.window_fill = PANEL;
+        visuals.override_text_color = Some(Color32::from_rgb(200, 223, 240));
+        cc.egui_ctx.set_visuals(visuals);
+
+        let mut app = Self {
+            test_state:    TestState::Idle,
+            result:        Arc::new(Mutex::new(SpeedResult::default())),
+            dl_history:    Arc::new(Mutex::new(Vec::new())),
+            ul_history:    Arc::new(Mutex::new(Vec::new())),
+            ping_history:  Arc::new(Mutex::new(Vec::new())),
+            log_lines:     Arc::new(Mutex::new(vec![
+                ("NetSpeed Analyzer v0.2 起動".into(), ACCENT3),
+                ("speed.cloudflare.com を使用".into(), MUTED),
+            ])),
+            stop_flag:     Arc::new(AtomicBool::new(false)),
+            subnet_input:  "192.168.1".into(),
+            scan_state:    Arc::new(Mutex::new(ScanState::default())),
+            scan_stop:     Arc::new(AtomicBool::new(false)),
+            speed_history: Vec::new(),
+            wifi_info:     Arc::new(Mutex::new(WifiInfo::default())),
+            wifi_timer:    0.0,
+            iperf_state:   Arc::new(Mutex::new(IperfState::default())),
+            iperf_stop:    Arc::new(AtomicBool::new(false)),
+            active_tab:    0,
+        };
+        app.refresh_wifi();
+        app
     }
-    fs::write(&path, out).map_err(|e| e.to_string())?;
-    Ok(path)
-}
 
-pub fn save_json(entries: &[HistoryEntry]) -> Result<PathBuf, String> {
-    let path = history_path("json");
-    let json = serde_json::to_string_pretty(entries).map_err(|e| e.to_string())?;
-    fs::write(&path, json).map_err(|e| e.to_string())?;
-    Ok(path)
-}
-
-pub fn new_entry(dl: Option<f64>, ul: Option<f64>, ping: Option<f64>, jitter: Option<f64>) -> HistoryEntry {
-    HistoryEntry {
-        timestamp: timestamp_str(),
-        dl_mbps:   dl,
-        ul_mbps:   ul,
-        ping_ms:   ping,
-        jitter_ms: jitter,
+    fn add_log(&self, msg: impl Into<String>, color: Color32) {
+        let mut log = self.log_lines.lock().unwrap();
+        log.push((format!("[{}] {}", now_str(), msg.into()), color));
+        if log.len() > 300 { log.drain(0..50); }
     }
-}
+
+    fn refresh_wifi(&self) {
+        let wifi = Arc::clone(&self.wifi_info);
+        thread::spawn(move || {
+            let info = wifi::get_wifi_info();
+            *wifi.lock().unwrap() = info;
+        });
+    }
+
+    fn start_test(&mut self, ctx: &egui::Context) {
+        self.test_state = TestState::Running;
+        self.stop_flag.store(false, Ordering::Relaxed);
+        self.dl_history.lock().unwrap().clear();
+        self.ul_history.lock().unwrap().clear();
+        self.ping_history.lock().unwrap().clear();
+        *self.result.lock().unwrap() = SpeedResult::default();
+
+        let result    = Arc::clone(&self.result);
+        let dl_hist   = Arc::clone(&self.dl_history);
+        let ul_hist   = Arc::clone(&self.ul_history);
+        let ping_hist = Arc::clone(&self.ping_history);
+        let log       = Arc::clone(&self.log_lines);
+        let stop      = Arc::clone(&self.stop_flag);
+        let ctx       = ctx.clone();
+
+        fn plog(log: &Arc<Mutex<Vec<(String,Color32)>>>, msg: &str, c: Color32) {
+            log.lock().unwrap().push((format!("[{}] {}", now_str(), msg), c));
+        }
+
+        thread::spawn(move || {
+            plog(&log, "Ping測定中...", MUTED); ctx.request_repaint();
+            if let Some(p) = measure::measure_ping(5) {
+                let mut r = result.lock().unwrap();
+                r.ping_ms = Some(p.avg); r.jitter = Some(p.jitter);
+                r.min_ping = Some(p.min); r.max_ping = Some(p.max);
+                ping_hist.lock().unwrap().push(p.avg);
+                plog(&log, &format!("Ping: {:.1}ms  jitter: {:.1}ms", p.avg, p.jitter), ACCENT3);
+            } else { plog(&log, "Ping失敗", DANGER); }
+            ctx.request_repaint();
+            if stop.load(Ordering::Relaxed) { return; }
+
+            plog(&log, "DL測定中...", MUTED); ctx.request_repaint();
+            let dl2 = Arc::clone(&dl_hist);
+            let log2 = Arc::clone(&log);
+            let ctx2 = ctx.clone();
+            let final_dl = measure::measure_download(3, move |mbps| {
+                dl2.lock().unwrap().push(mbps);
+                plog(&log2, &format!("  DL: {:.1} Mbps", mbps), MUTED);
+                ctx2.request_repaint();
+            });
+            if let Some(dl) = final_dl {
+                result.lock().unwrap().dl_mbps = Some(dl);
+                plog(&log, &format!("DL完了: {:.1} Mbps", dl), ACCENT);
+            } else { plog(&log, "DL失敗", DANGER); }
+            ctx.request_repaint();
+            if stop.load(Ordering::Relaxed) { return; }
+
+            plog(&log, "UL測定中...", MUTED); ctx.request_repaint();
+            let ul2 = Arc::clone(&ul_hist);
+            let log3 = Arc::clone(&log);
+            let ctx3 = ctx.clone();
+            let final_ul = measure::measure_upload(2, move |mbps| {
+                ul2.lock().unwrap().push(mbps);
+                plog(&log3, &format!("  UL: {:.1} Mbps", mbps), MUTED);
+                ctx3.request_repaint();
+            });
+            if let Some(ul) = final_ul {
+                result.lock().unwrap().ul_mbps = Some(ul);
+                plog(&log, &format!("UL完了: {:.1} Mbps", ul), ACCENT2);
+            } else { plog(&log, "UL失敗", DANGER); }
+            plog(&log, "テスト完了 ✓", ACCENT3);
+            ctx.request_repaint();
+        });
+    }
+
+    fn start_scan(&mut self, ctx: &egui::Context) {
+        let parts: Vec<&str> = self.subnet_input.split('.').collect();
+        if parts.len() != 3 {
+            self.add_log("サブネット形式エラー (例: 192.168.1)", DANGER);
+            return;
+        }
+        let subnet = [
+            parts[0].parse::<u8>().unwrap_or(192),
+            parts[1].parse::<u8>().unwrap_or(168),
+            parts[2].parse::<u8>().unwrap_or(1),
+        ];
+        {
+            let mut s = self.scan_state.lock().unwrap();
+            s.running = true; s.progress = 0.0;
+            s.status = "ARPテーブル取得中...".into();
+            s.hosts.clear();
+        }
+        self.scan_stop.store(false, Ordering::Relaxed);
+        self.add_log(&format!("スキャン開始: {}.1–254", self.subnet_input), ACCENT);
+
+        let ss   = Arc::clone(&self.scan_state);
+        let log  = Arc::clone(&self.log_lines);
+        let stop = Arc::clone(&self.scan_stop);
+        let ctx  = ctx.clone();
+
+        thread::spawn(move || {
+            let ss_found = Arc::clone(&ss);
+            let ss_prog  = Arc::clone(&ss);
+            let log2     = Arc::clone(&log);
+            let ctx2     = ctx.clone();
+            let ctx3     = ctx.clone();
+
+            scan::scan_subnet(subnet, 500,
+                move |host| {
+                    let name = host.hostname.clone().unwrap_or_else(|| "—".into());
+
+                    let mut state = ss_found.lock().unwrap();
+                    if let Some(existing) = state.hosts.iter_mut().find(|h| h.ip == host.ip) {
+
+                        if host.latency_ms > 0.0 { *existing = host.clone(); }
+                    } else {
+                        log2.lock().unwrap().push((
+                            format!("[{}] {} ({})  {:.0}ms", now_str(), host.ip, name, host.latency_ms),
+                            ACCENT3));
+                        state.hosts.push(host);
+
+                        state.hosts.sort_by_key(|h| {
+                            let o = h.ip.octets();
+                            ((o[0] as u32) << 24) | ((o[1] as u32) << 16) | ((o[2] as u32) << 8) | o[3] as u32
+                        });
+                    }
+                    ctx2.request_repaint();
+                },
+                move |p, status| {
+                    let mut s = ss_prog.lock().unwrap();
+                    s.progress = p;
+                    s.status = status;
+                    ctx3.request_repaint();
+                },
+                stop,
+            );
+            let found = ss.lock().unwrap().hosts.len();
+            {
+                let mut s = ss.lock().unwrap();
+                s.running = false;
+                s.status = format!("完了: {}台検出", found);
+            }
+            log.lock().unwrap().push((
+                format!("[{}] スキャン完了: {}台", now_str(), found),
+                if found > 0 { ACCENT3 } else { MUTED }));
+            ctx.request_repaint();
+        });
+    }
+
+    fn start_smb_write(&mut self, ctx: &egui::Context) {
+        let path = self.iperf_state.lock().unwrap().smb_path.clone();
+        if path.is_empty() {
+            self.add_log("SMBパスを入力してください (例: \\\\192.168.1.10\\share)", DANGER);
+            return;
+        }
+        self.iperf_stop.store(false, Ordering::Relaxed);
+        self.iperf_state.lock().unwrap().mode = IperfMode::Running;
+        self.iperf_state.lock().unwrap().live_mbps = 0.0;
+        self.add_log(&format!("SMB書き込み測定: {}", path), ACCENT);
+
+        let state = Arc::clone(&self.iperf_state);
+        let log   = Arc::clone(&self.log_lines);
+        let stop  = Arc::clone(&self.iperf_stop);
+        let ctx   = ctx.clone();
+
+        thread::spawn(move || {
+            let state2 = Arc::clone(&state);
+            let ctx2   = ctx.clone();
+            let result = iperf::measure_smb_write(&path, stop, move |mbps| {
+                state2.lock().unwrap().live_mbps = mbps;
+                ctx2.request_repaint();
+            });
+            match result {
+                Ok(r) => {
+                    log.lock().unwrap().push((
+                        format!("[{}] SMB Write: {:.1} Mbps ({:.1}s, {:.0}MB)",
+                            now_str(), r.mbps, r.duration, r.bytes as f64/1_048_576.0),
+                        ACCENT3));
+                    let mut s = state.lock().unwrap();
+                    s.history.push(("Write".into(), r.mbps));
+                    s.result = Some(r);
+                    s.mode = IperfMode::Done;
+                }
+                Err(e) => {
+                    log.lock().unwrap().push((format!("[{}] 失敗: {}", now_str(), e), DANGER));
+                    state.lock().unwrap().mode = IperfMode::Idle;
+                }
+            }
+            ctx.request_repaint();
+        });
+    }
+
+    fn start_smb_read(&mut self, ctx: &egui::Context) {
+        let path = self.iperf_state.lock().unwrap().smb_path.clone();
+        if path.is_empty() {
+            self.add_log("SMBパスを入力してください", DANGER);
+            return;
+        }
+        self.iperf_stop.store(false, Ordering::Relaxed);
+        self.iperf_state.lock().unwrap().mode = IperfMode::Running;
+        self.iperf_state.lock().unwrap().live_mbps = 0.0;
+        self.add_log(&format!("SMB読み込み測定: {}", path), ACCENT2);
+
+        let state = Arc::clone(&self.iperf_state);
+        let log   = Arc::clone(&self.log_lines);
+        let stop  = Arc::clone(&self.iperf_stop);
+        let ctx   = ctx.clone();
+
+        thread::spawn(move || {
+            let state2 = Arc::clone(&state);
+            let ctx2   = ctx.clone();
+            let result = iperf::measure_smb_read(&path, stop, move |mbps| {
+                state2.lock().unwrap().live_mbps = mbps;
+                ctx2.request_repaint();
+            });
+            match result {
+                Ok(r) => {
+                    log.lock().unwrap().push((
+                        format!("[{}] SMB Read: {:.1} Mbps ({:.1}s, {:.0}MB)",
+                            now_str(), r.mbps, r.duration, r.bytes as f64/1_048_576.0),
+                        ACCENT2));
+                    let mut s = state.lock().unwrap();
+                    s.history.push(("Read".into(), r.mbps));
+                    s.result = Some(r);
+                    s.mode = IperfMode::Done;
+                }
+                Err(e) => {
+                    log.lock().unwrap().push((format!("[{}] 失敗: {}", now_str(), e), DANGER));
+                    state.lock().unwrap().mode = IperfMode::Idle;
+                }
+            }
+            ctx.request_repaint();
+        });
+    }
+
+
+    fn draw_iperf_tab(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        egui::Frame::none().fill(PANEL).rounding(8.0)
+            .inner_margin(egui::Margin::same(14.0))
+            .show(ui, |ui| {
+                section_title(ui, "LAN THROUGHPUT  (SMB 共有フォルダ経由)");
+                ui.add_space(4.0);
+                ui.label(RichText::new(
+                    "対象PCの共有フォルダパスを入力するだけで測定できます。追加ソフト不要。")
+                    .font(FontId::monospace(10.0)).color(MUTED));
+                ui.add_space(10.0);
+
+                let state = self.iperf_state.lock().unwrap().clone();
+                let busy = state.mode == IperfMode::Running;
+
+
+                egui::Frame::none()
+                    .stroke(Stroke::new(1.0, MUTED)).rounding(6.0)
+                    .inner_margin(egui::Margin::same(12.0))
+                    .show(ui, |ui| {
+                        ui.label(RichText::new("SMB 共有パス").font(FontId::monospace(10.0)).color(MUTED));
+                        ui.add_space(4.0);
+                        let mut path = self.iperf_state.lock().unwrap().smb_path.clone();
+                        let changed = ui.add(
+                            egui::TextEdit::singleline(&mut path)
+                                .font(FontId::monospace(13.0))
+                                .desired_width(ui.available_width())
+                                .hint_text("例: \\\\192.168.1.10\\share  または  Z:\\")
+                        ).changed();
+                        if changed {
+                            self.iperf_state.lock().unwrap().smb_path = path;
+                        }
+                        ui.add_space(6.0);
+                        ui.label(RichText::new(
+                            "💡 対象PCで共有フォルダを作成し、このPCからアクセスできるパスを入力してください")
+                            .font(FontId::monospace(9.0)).color(MUTED));
+                    });
+
+                ui.add_space(10.0);
+
+
+                ui.horizontal(|ui| {
+                    if ui.add_enabled(!busy, egui::Button::new(
+                        RichText::new("▶ 書き込み測定 (Write)").font(FontId::monospace(12.0)).color(ACCENT))
+                        .stroke(Stroke::new(1.0, ACCENT))
+                        .fill(Color32::from_rgba_unmultiplied(0,212,255,10))
+                        .min_size(Vec2::new(200.0, 36.0))
+                    ).on_hover_text("共有フォルダへの書き込み速度を測定（5秒間）")
+                    .clicked() { self.start_smb_write(ctx); }
+
+                    ui.add_space(8.0);
+
+                    if ui.add_enabled(!busy, egui::Button::new(
+                        RichText::new("▶ 読み込み測定 (Read)").font(FontId::monospace(12.0)).color(ACCENT2))
+                        .stroke(Stroke::new(1.0, ACCENT2))
+                        .fill(Color32::from_rgba_unmultiplied(255,107,53,10))
+                        .min_size(Vec2::new(200.0, 36.0))
+                    ).on_hover_text("共有フォルダからの読み込み速度を測定（パスはファイルを指定）")
+                    .clicked() { self.start_smb_read(ctx); }
+
+                    if busy {
+                        ui.add_space(8.0);
+                        if ui.add(egui::Button::new(
+                            RichText::new("■ STOP").font(FontId::monospace(11.0)).color(DANGER))
+                            .stroke(Stroke::new(1.0, DANGER)).fill(Color32::TRANSPARENT)
+                        ).clicked() {
+                            self.iperf_stop.store(true, Ordering::Relaxed);
+                        }
+                    }
+                });
+
+
+                if busy {
+                    ui.add_space(10.0);
+                    let live = self.iperf_state.lock().unwrap().live_mbps;
+                    egui::Frame::none()
+                        .fill(Color32::from_rgba_unmultiplied(0,212,255,6))
+                        .rounding(6.0).inner_margin(egui::Margin::same(12.0))
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new("測定中...").font(FontId::monospace(11.0)).color(MUTED));
+                                ui.add_space(10.0);
+                                ui.label(RichText::new(format!("{:.1} Mbps", live))
+                                    .font(FontId::monospace(28.0)).color(ACCENT).strong());
+                            });
+                            let bar_pct = (live / 1000.0).min(1.0) as f32;
+                            let (r, _) = ui.allocate_exact_size(
+                                Vec2::new(ui.available_width(), 4.0), egui::Sense::hover());
+                            ui.painter().rect_filled(r, 2.0,
+                                Color32::from_rgba_unmultiplied(255,255,255,8));
+                            if bar_pct > 0.0 {
+                                let f = egui::Rect::from_min_size(
+                                    r.min, Vec2::new(r.width()*bar_pct, r.height()));
+                                ui.painter().rect_filled(f, 2.0, ACCENT);
+                            }
+                        });
+                }
+
+
+                let state = self.iperf_state.lock().unwrap().clone();
+                if let Some(ref r) = state.result {
+                    ui.add_space(10.0);
+                    egui::Frame::none()
+                        .fill(Color32::from_rgba_unmultiplied(57,255,20,6))
+                        .rounding(6.0).inner_margin(egui::Margin::same(14.0))
+                        .show(ui, |ui| {
+                            ui.label(RichText::new(format!("{:.1} Mbps", r.mbps))
+                                .font(FontId::monospace(40.0))
+                                .color(if r.direction.starts_with("Write") { ACCENT } else { ACCENT2 })
+                                .strong());
+                            ui.label(RichText::new(format!(
+                                "{}  |  {:.0} MB 転送  |  {:.1}秒  |  {}",
+                                r.direction,
+                                r.bytes as f64 / 1_048_576.0,
+                                r.duration,
+                                r.path))
+                                .font(FontId::monospace(10.0)).color(MUTED));
+                        });
+                }
+
+
+                if !state.history.is_empty() {
+                    ui.add_space(10.0);
+                    section_title(ui, "HISTORY");
+                    ui.add_space(4.0);
+
+
+                    let max = state.history.iter().map(|(_, v)| *v).fold(0.0f64, f64::max).max(100.0);
+                    egui::ScrollArea::horizontal().show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            for (dir, mbps) in &state.history {
+                                let color = if dir == "Write" { ACCENT } else { ACCENT2 };
+                                let pct = (*mbps / max) as f32;
+                                ui.vertical(|ui| {
+                                    ui.label(RichText::new(format!("{:.0}", mbps))
+                                        .font(FontId::monospace(9.0)).color(color));
+                                    let (r, _) = ui.allocate_exact_size(
+                                        Vec2::new(36.0, 60.0), egui::Sense::hover());
+                                    ui.painter().rect_filled(
+                                        egui::Rect::from_min_size(
+                                            egui::pos2(r.min.x, r.max.y - r.height()*pct),
+                                            Vec2::new(r.width(), r.height()*pct)),
+                                        2.0, color);
+                                    ui.painter().rect_stroke(r, 2.0, Stroke::new(0.5, MUTED));
+                                    ui.label(RichText::new(if dir == "Write" { "W" } else { "R" })
+                                        .font(FontId::monospace(9.0)).color(MUTED));
+                                });
+                                ui.add_space(4.0);
+                            }
+                        });
+                    });
+                }
+            });
+    }
+
+

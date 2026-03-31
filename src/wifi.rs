@@ -1,9 +1,9 @@
-// src/wifi.rs — Wi-Fi シグナル強度（Windows: netsh コマンド経由）
+
 
 #[derive(Clone, Debug, Default)]
 pub struct WifiInfo {
     pub ssid:       Option<String>,
-    pub signal_pct: Option<u32>,   // 0–100
+    pub signal_pct: Option<u32>,
     pub bssid:      Option<String>,
     pub radio_type: Option<String>,
 }
