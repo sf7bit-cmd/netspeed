@@ -380,6 +380,279 @@ impl App {
     }
 
 
+impl eframe::App for App {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if self.test_state == TestState::Running {
+            ctx.request_repaint_after(std::time::Duration::from_millis(200));
+        }
+        if self.test_state == TestState::Running {
+            let r = self.result.lock().unwrap();
+            if r.dl_mbps.is_some() && r.ul_mbps.is_some() {
+                let entry = history::new_entry(r.dl_mbps, r.ul_mbps, r.ping_ms, r.jitter);
+                drop(r);
+                self.speed_history.push(entry);
+                self.test_state = TestState::Done;
+            }
+        }
+        self.wifi_timer += ctx.input(|i| i.unstable_dt) as f64;
+        if self.wifi_timer > 30.0 { self.wifi_timer = 0.0; self.refresh_wifi(); }
+
+        egui::CentralPanel::default()
+            .frame(egui::Frame::none().fill(BG).inner_margin(egui::Margin::same(14.0)))
+            .show(ctx, |ui| {
+                self.draw_header(ui);
+                ui.add_space(8.0);
+                self.draw_tabs(ui);
+                ui.add_space(10.0);
+                match self.active_tab {
+                    0 => self.draw_speed_tab(ui, ctx),
+                    1 => self.draw_lan_tab(ui, ctx),
+                    2 => self.draw_iperf_tab(ui, ctx),
+                    3 => self.draw_history_tab(ui),
+                    _ => {}
+                }
+                ui.add_space(8.0);
+                self.draw_log(ui);
+            });
+    }
+}
+
+impl App {
+    fn draw_header(&self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            let (r, _) = ui.allocate_exact_size(Vec2::new(40.0, 40.0), egui::Sense::hover());
+            ui.painter().rect_stroke(r, 6.0, Stroke::new(2.0, ACCENT));
+            ui.painter().text(r.center(), egui::Align2::CENTER_CENTER,
+                "NS", FontId::monospace(16.0), ACCENT);
+            ui.add_space(10.0);
+            ui.vertical(|ui| {
+                ui.label(RichText::new("NETSPEED ANALYZER")
+                    .font(FontId::proportional(18.0)).color(Color32::WHITE).strong());
+                ui.label(RichText::new("v0.2  LAN NETWORK TOOL")
+                    .font(FontId::monospace(9.0)).color(MUTED));
+            });
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let wifi = self.wifi_info.lock().unwrap().clone();
+                if let Some(pct) = wifi.signal_pct {
+                    let color = if pct >= 70 { ACCENT3 } else if pct >= 40 { WARN } else { DANGER };
+                    let bars = if pct >= 75 { "IIII" } else if pct >= 50 { "III_" }
+                               else if pct >= 25 { "II__" } else { "I___" };
+                    ui.label(RichText::new(format!("{} {}%", bars, pct))
+                        .font(FontId::monospace(12.0)).color(color));
+                    if let Some(ssid) = &wifi.ssid {
+                        ui.label(RichText::new(ssid).font(FontId::monospace(10.0)).color(MUTED));
+                    }
+                    ui.add_space(8.0);
+                }
+                let (st, sc) = match self.test_state {
+                    TestState::Idle    => ("READY",   ACCENT3),
+                    TestState::Running => ("TESTING", ACCENT),
+                    TestState::Done    => ("DONE",    ACCENT3),
+                };
+                ui.label(RichText::new(format!("● {}", st)).font(FontId::monospace(11.0)).color(sc));
+            });
+        });
+        ui.add_space(6.0);
+        ui.separator();
+    }
+
+    fn draw_tabs(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            for (i, label) in ["SPEED TEST", "LAN SCAN", "LAN THROUGHPUT", "HISTORY"].iter().enumerate() {
+                let active = self.active_tab == i as u8;
+                let color  = if active { ACCENT } else { MUTED };
+                let fill   = if active { Color32::from_rgba_unmultiplied(0,212,255,18) } else { Color32::TRANSPARENT };
+                if ui.add(egui::Button::new(
+                    RichText::new(*label).font(FontId::monospace(11.0)).color(color))
+                    .fill(fill)
+                    .stroke(Stroke::new(if active { 1.5 } else { 0.5 }, color))
+                    .min_size(Vec2::new(120.0, 28.0))
+                ).clicked() { self.active_tab = i as u8; }
+                ui.add_space(4.0);
+            }
+        });
+    }
+
+    fn draw_speed_tab(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let r = self.result.lock().unwrap().clone();
+        let testing = self.test_state == TestState::Running;
+        ui.columns(3, |cols| {
+            gauge_card(&mut cols[0], "DOWN", r.dl_mbps, "Mbps", ACCENT,  1000.0, testing);
+            gauge_card(&mut cols[1], "UP",   r.ul_mbps, "Mbps", ACCENT2, 1000.0, testing);
+            gauge_card(&mut cols[2], "PING", r.ping_ms, "ms",   ACCENT3,  200.0, testing);
+        });
+        ui.add_space(8.0);
+        ui.columns(2, |cols| {
+            {
+                let ui = &mut cols[0];
+                let dl   = self.dl_history.lock().unwrap().clone();
+                let ul   = self.ul_history.lock().unwrap().clone();
+                let ping = self.ping_history.lock().unwrap().clone();
+                egui::Frame::none().fill(PANEL).rounding(8.0)
+                    .inner_margin(egui::Margin::same(12.0))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("REALTIME").font(FontId::monospace(9.0)).color(MUTED));
+                            legend_dot(ui, ACCENT, "DL"); legend_dot(ui, ACCENT2, "UL"); legend_dot(ui, ACCENT3, "Ping");
+                        });
+                        Plot::new("speed_graph").height(120.0).show_axes([false, true])
+                            .allow_zoom(false).allow_drag(false).show(ui, |p| {
+                                if !dl.is_empty()   { p.line(Line::new(pts(&dl)).color(ACCENT).width(2.0)); }
+                                if !ul.is_empty()   { p.line(Line::new(pts(&ul)).color(ACCENT2).width(2.0)); }
+                                if !ping.is_empty() { p.line(Line::new(pts(&ping)).color(ACCENT3).width(1.5)); }
+                            });
+                    });
+            }
+            {
+                let ui = &mut cols[1];
+                egui::Frame::none().fill(PANEL).rounding(8.0)
+                    .inner_margin(egui::Margin::same(12.0))
+                    .show(ui, |ui| {
+                        section_title(ui, "CONTROLS");
+                        ui.add_space(6.0);
+                        let w = ui.available_width();
+                        let testing = self.test_state == TestState::Running;
+                        if ui.add_enabled(!testing, egui::Button::new(
+                            RichText::new("START TEST").font(FontId::monospace(13.0)).color(ACCENT))
+                            .min_size(Vec2::new(w, 38.0)).stroke(Stroke::new(1.5, ACCENT))
+                            .fill(Color32::from_rgba_unmultiplied(0,212,255,12))
+                        ).clicked() { self.start_test(ctx); }
+                        ui.add_space(4.0);
+                        if ui.add_enabled(testing, egui::Button::new(
+                            RichText::new("STOP").font(FontId::monospace(12.0)).color(DANGER))
+                            .min_size(Vec2::new(w, 30.0)).stroke(Stroke::new(1.0, if testing { DANGER } else { MUTED }))
+                            .fill(Color32::TRANSPARENT)
+                        ).clicked() { self.stop_flag.store(true, Ordering::Relaxed); self.test_state = TestState::Idle; }
+                        ui.add_space(4.0);
+                        if ui.add_enabled(!testing, egui::Button::new(
+                            RichText::new("RESET").font(FontId::monospace(10.0)).color(MUTED))
+                            .min_size(Vec2::new(w, 24.0)).stroke(Stroke::new(1.0, MUTED))
+                            .fill(Color32::TRANSPARENT)
+                        ).clicked() {
+                            *self.result.lock().unwrap() = SpeedResult::default();
+                            self.dl_history.lock().unwrap().clear();
+                            self.ul_history.lock().unwrap().clear();
+                            self.ping_history.lock().unwrap().clear();
+                            self.test_state = TestState::Idle;
+                        }
+                        ui.add_space(10.0);
+                        section_title(ui, "DETAILS");
+                        let r = self.result.lock().unwrap().clone();
+                        info_row(ui, "MIN PING", r.min_ping.map(|v| format!("{:.1} ms", v)));
+                        info_row(ui, "MAX PING", r.max_ping.map(|v| format!("{:.1} ms", v)));
+                        info_row(ui, "JITTER",   r.jitter.map(|v| format!("{:.1} ms", v)));
+                        info_row(ui, "SERVER",   Some("speed.cloudflare.com".into()));
+                        ui.add_space(10.0);
+                        section_title(ui, "SAVE");
+                        ui.horizontal(|ui| {
+                            if ui.add(egui::Button::new(RichText::new("CSV").font(FontId::monospace(11.0)).color(ACCENT))
+                                .stroke(Stroke::new(1.0, ACCENT)).fill(Color32::TRANSPARENT)).clicked() {
+                                match history::save_csv(&self.speed_history) {
+                                    Ok(p)  => self.add_log(&format!("CSV: {}", p.display()), ACCENT3),
+                                    Err(e) => self.add_log(&format!("Error: {}", e), DANGER),
+                                }
+                            }
+                            if ui.add(egui::Button::new(RichText::new("JSON").font(FontId::monospace(11.0)).color(ACCENT2))
+                                .stroke(Stroke::new(1.0, ACCENT2)).fill(Color32::TRANSPARENT)).clicked() {
+                                match history::save_json(&self.speed_history) {
+                                    Ok(p)  => self.add_log(&format!("JSON: {}", p.display()), ACCENT3),
+                                    Err(e) => self.add_log(&format!("Error: {}", e), DANGER),
+                                }
+                            }
+                        });
+                    });
+            }
+        });
+    }
+
+    fn draw_lan_tab(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        egui::Frame::none().fill(PANEL).rounding(8.0)
+            .inner_margin(egui::Margin::same(14.0))
+            .show(ui, |ui| {
+                section_title(ui, "LAN HOST SCAN");
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Subnet:").font(FontId::monospace(11.0)).color(MUTED));
+                    ui.add(egui::TextEdit::singleline(&mut self.subnet_input)
+                        .font(FontId::monospace(12.0)).desired_width(120.0));
+                    ui.label(RichText::new(".1-254").font(FontId::monospace(11.0)).color(MUTED));
+                    ui.add_space(10.0);
+                    let running = self.scan_state.lock().unwrap().running;
+                    if ui.add_enabled(!running, egui::Button::new(
+                        RichText::new("SCAN").font(FontId::monospace(12.0)).color(ACCENT))
+                        .stroke(Stroke::new(1.0, ACCENT)).fill(Color32::TRANSPARENT)
+                    ).clicked() { self.start_scan(ctx); }
+                    if running {
+                        if ui.add(egui::Button::new(
+                            RichText::new("STOP").font(FontId::monospace(11.0)).color(DANGER))
+                            .stroke(Stroke::new(1.0, DANGER)).fill(Color32::TRANSPARENT)
+                        ).clicked() { self.scan_stop.store(true, Ordering::Relaxed); }
+                    }
+                });
+                {
+                    let s = self.scan_state.lock().unwrap();
+                    if s.running || s.progress > 0.0 {
+                        ui.add_space(6.0);
+                        ui.horizontal(|ui| {
+                            ui.add(egui::ProgressBar::new(s.progress)
+                                .desired_width(ui.available_width() - 160.0));
+                            ui.label(RichText::new(&s.status)
+                                .font(FontId::monospace(10.0)).color(MUTED));
+                        });
+                    }
+                }
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("IP ADDRESS").font(FontId::monospace(10.0)).color(MUTED));
+                    ui.add_space(80.0);
+                    ui.label(RichText::new("HOSTNAME").font(FontId::monospace(10.0)).color(MUTED));
+                    ui.add_space(80.0);
+                    ui.label(RichText::new("LATENCY").font(FontId::monospace(10.0)).color(MUTED));
+                    ui.add_space(30.0);
+                    ui.label(RichText::new("PORTS").font(FontId::monospace(10.0)).color(MUTED));
+                });
+                ui.separator();
+                let hosts = self.scan_state.lock().unwrap().hosts.clone();
+                egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                    if hosts.is_empty() {
+                        ui.label(RichText::new("Waiting for scan...").font(FontId::monospace(11.0)).color(MUTED));
+                    }
+                    for host in &hosts {
+                        ui.horizontal(|ui| {
+                            let (dr, _) = ui.allocate_exact_size(Vec2::splat(8.0), egui::Sense::hover());
+                            ui.painter().circle_filled(dr.center(), 4.0, ACCENT3);
+                            let ip_str = host.ip.to_string();
+                            let web_url = host.web_port.map(|p| {
+                                let scheme = if p == 443 || p == 8443 { "https" } else { "http" };
+                                format!("{}://{}:{}", scheme, ip_str, p)
+                            });
+                            if let Some(ref url) = web_url {
+                                if ui.add(egui::Button::new(
+                                    RichText::new(&ip_str).font(FontId::monospace(12.0)).color(ACCENT))
+                                    .stroke(Stroke::new(0.5, ACCENT)).fill(Color32::TRANSPARENT)
+                                ).on_hover_text(url).clicked() { let _ = open::that(url); }
+                            } else {
+                                ui.label(RichText::new(&ip_str).font(FontId::monospace(12.0))
+                                    .color(Color32::from_rgb(200, 223, 240)));
+                            }
+                            ui.add_space(8.0);
+                            let name = host.hostname.clone().unwrap_or_else(|| "-".into());
+                            ui.label(RichText::new(&name).font(FontId::monospace(11.0)).color(MUTED));
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                let ports: Vec<String> = host.open_ports.iter().map(|p| p.to_string()).collect();
+                                ui.label(RichText::new(ports.join(" ")).font(FontId::monospace(10.0)).color(MUTED));
+                                ui.add_space(20.0);
+                                let ms = host.latency_ms;
+                                let color = if ms < 5.0 { ACCENT3 } else if ms < 30.0 { WARN } else { DANGER };
+                                ui.label(RichText::new(format!("{:.0} ms", ms))
+                                    .font(FontId::monospace(11.0)).color(color));
+                            });
+                        });
+                    }
+                });
+            });
+    }
+
     fn draw_iperf_tab(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         egui::Frame::none().fill(PANEL).rounding(8.0)
             .inner_margin(egui::Margin::same(14.0))
@@ -695,4 +968,7 @@ fn now_str() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let s = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
     format!("{:02}:{:02}:{:02}", (s/3600)%24, (s/60)%60, s%60)
+}
+
+}
 }
